@@ -57,8 +57,7 @@ try:
     PLAYWRIGHT_OK = True
 except ImportError:
     PLAYWRIGHT_OK = False
-    print("[WARN] playwright not installed.")
-    print("       Run: pip install playwright && playwright install chromium")
+    # Playwright not available on cloud — LinkedIn scraping disabled, Unstop + Internshala still work
 
 # ── Server config ─────────────────────────────────────────────────────────────
 PORT            = 5050
@@ -949,17 +948,179 @@ def deduplicate(listings):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# JSEARCH SCRAPER (RapidAPI — LinkedIn + Indeed + Glassdoor aggregator)
+# ════════════════════════════════════════════════════════════════════════════════
+
+RAPIDAPI_KEY = "799b1e3b70msh9637936508c0ff0p1427c0jsnf79f16ca3ae3"
+
+def scrape_jsearch():
+    if not REQUESTS_OK:
+        return []
+    results = []
+    queries = [
+        "software engineering internship india",
+        "web development internship india",
+        "data science internship india",
+        "computer science internship india",
+        "machine learning internship india",
+    ]
+    headers = {
+        "X-RapidAPI-Key":  RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+    }
+    for query in queries:
+        try:
+            url = "https://jsearch.p.rapidapi.com/search"
+            params = {
+                "query":        query,
+                "page":         "1",
+                "num_pages":    "1",
+                "date_posted":  "month",
+                "employment_types": "INTERN",
+            }
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code != 200:
+                print(f"  [JSearch] {query} → HTTP {resp.status_code}")
+                continue
+            data = resp.json().get("data", [])
+            for job in data:
+                try:
+                    title    = clean_text(job.get("job_title", ""))
+                    company  = clean_text(job.get("employer_name", ""))
+                    location = clean_text(job.get("job_city", "") or job.get("job_country", "India"))
+                    desc     = clean_text(job.get("job_description", "")[:200])
+                    apply_url= job.get("job_apply_link", "#")
+                    posted_ts= job.get("job_posted_at_timestamp")
+                    days_ago = 0
+                    if posted_ts:
+                        diff = datetime.now() - datetime.fromtimestamp(posted_ts)
+                        days_ago = max(0, diff.days)
+                    source_label = (job.get("job_publisher") or "jsearch").lower()
+                    if "linkedin" in source_label:   src = "linkedin"
+                    elif "indeed"  in source_label:  src = "indeed"
+                    elif "glassdoor" in source_label: src = "glassdoor"
+                    else:                             src = "jsearch"
+
+                    skills   = infer_skills(title)
+                    domain   = infer_domain(title)
+                    stipend  = 0
+                    sal = job.get("job_min_salary") or job.get("job_max_salary")
+                    if sal:
+                        stipend = int(float(sal))
+                        if stipend > 200000: stipend = stipend // 12
+
+                    dl_days  = random.randint(14, 45)
+                    results.append({
+                        "id":          make_id(src, title, company),
+                        "title":       title,
+                        "company":     company,
+                        "location":    location or "India",
+                        "duration":    "3 Months",
+                        "stipend":     stipend,
+                        "skills":      skills,
+                        "domain":      domain,
+                        "type":        "remote" if job.get("job_is_remote") else "onsite",
+                        "source":      src,
+                        "logo":        f'<div style="font-size:1.3rem">💼</div>',
+                        "apply_url":   apply_url,
+                        "description": desc,
+                        "posted":      posted_label(days_ago),
+                        "deadline":    deadline_from_days(dl_days),
+                        "urgency":     urgency(dl_days),
+                        "isNew":       days_ago <= 3,
+                        "matchScore":  random.randint(60, 95),
+                    })
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"  [JSearch] query '{query}' failed: {e}")
+    return results
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# REMOTIVE SCRAPER (Free API — Remote tech internships worldwide)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def scrape_remotive():
+    if not REQUESTS_OK:
+        return []
+    results = []
+    categories = ["software-dev", "data", "devops", "design", "marketing"]
+    for cat in categories:
+        try:
+            url  = f"https://remotive.com/api/remote-jobs?category={cat}&limit=20"
+            resp = requests.get(url, timeout=15, headers={"User-Agent": rand_ua()})
+            if resp.status_code != 200:
+                continue
+            jobs = resp.json().get("jobs", [])
+            for job in jobs:
+                try:
+                    title    = clean_text(job.get("title", ""))
+                    company  = clean_text(job.get("company_name", ""))
+                    location = "Remote"
+                    desc     = clean_text(job.get("description", "")[:200])
+                    apply_url= job.get("url", "#")
+                    pub_date = job.get("publication_date", "")
+                    days_ago = 0
+                    if pub_date:
+                        try:
+                            pub = datetime.strptime(pub_date[:10], "%Y-%m-%d")
+                            days_ago = max(0, (datetime.now() - pub).days)
+                        except Exception:
+                            pass
+
+                    # Only include intern/junior/entry level roles
+                    title_l = title.lower()
+                    if not any(k in title_l for k in ["intern", "junior", "entry", "trainee", "graduate", "fresher"]):
+                        continue
+
+                    salary_str = job.get("salary", "") or ""
+                    stipend    = parse_stipend(salary_str)
+                    skills     = infer_skills(title)
+                    domain     = infer_domain(title)
+                    dl_days    = random.randint(14, 40)
+
+                    results.append({
+                        "id":          make_id("remotive", title, company),
+                        "title":       title,
+                        "company":     company,
+                        "location":    location,
+                        "duration":    "3-6 Months",
+                        "stipend":     stipend,
+                        "skills":      skills,
+                        "domain":      domain,
+                        "type":        "remote",
+                        "source":      "remotive",
+                        "logo":        f'<div style="font-size:1.3rem">🌐</div>',
+                        "apply_url":   apply_url,
+                        "description": desc,
+                        "posted":      posted_label(days_ago),
+                        "deadline":    deadline_from_days(dl_days),
+                        "urgency":     urgency(dl_days),
+                        "isNew":       days_ago <= 3,
+                        "matchScore":  random.randint(55, 90),
+                    })
+                except Exception:
+                    continue
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"  [Remotive] category '{cat}' failed: {e}")
+    return results
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # MAIN SCRAPE ORCHESTRATOR
 # ════════════════════════════════════════════════════════════════════════════════
 
 def run_all_scrapers():
     print("\n══════════════════════════════════════════════════")
     print("  GradeWise — Starting full live scrape")
-    print("  Sources: Unstop · Internshala · LinkedIn")
+    print("  Sources: Unstop · Internshala · JSearch · Remotive")
     print("══════════════════════════════════════════════════")
     all_results = []
 
-    print("\n[1/3] Unstop…")
+    print("\n[1/4] Unstop…")
     try:
         r = scrape_unstop()
         all_results.extend(r)
@@ -967,7 +1128,7 @@ def run_all_scrapers():
     except Exception as e:
         print(f"  [Unstop] FAILED: {e}")
 
-    print("\n[2/3] Internshala…")
+    print("\n[2/4] Internshala…")
     try:
         r = scrape_internshala()
         all_results.extend(r)
@@ -975,13 +1136,23 @@ def run_all_scrapers():
     except Exception as e:
         print(f"  [Internshala] FAILED: {e}")
 
-    print("\n[3/3] LinkedIn…")
+    print("\n[3/4] JSearch (LinkedIn + Indeed + Glassdoor)…")
     try:
-        r = scrape_linkedin()
+        r = scrape_jsearch()
         all_results.extend(r)
-        print(f"  → {len(r)} listings from LinkedIn")
+        print(f"  → {len(r)} listings from JSearch")
     except Exception as e:
-        print(f"  [LinkedIn] FAILED: {e}")
+        print(f"  [JSearch] FAILED: {e}")
+
+    print("\n[4/4] Remotive (Remote internships)…")
+    try:
+        r = scrape_remotive()
+        all_results.extend(r)
+        print(f"  → {len(r)} listings from Remotive")
+    except Exception as e:
+        print(f"  [Remotive] FAILED: {e}")
+
+    print("\n[LinkedIn] Skipped (Playwright not available on cloud)")
 
     deduped = deduplicate(all_results)
     random.shuffle(deduped)
@@ -991,8 +1162,13 @@ def run_all_scrapers():
         counts[item["source"]] = counts.get(item["source"], 0) + 1
 
     print(f"\n══ Done! Total unique real listings: {len(deduped)} ══")
+    emoji_map = {
+        "unstop": "🔴", "internshala": "🟠", "linkedin": "💼",
+        "indeed": "🔵", "glassdoor": "🟢", "jsearch": "🔍",
+        "remotive": "🌐"
+    }
     for src, cnt in sorted(counts.items()):
-        emoji = {"unstop": "🔴", "internshala": "🟠", "linkedin": "💼"}.get(src, "•")
+        emoji = emoji_map.get(src, "•")
         print(f"   {emoji}  {src:12s}: {cnt}")
     print("══════════════════════════════════════════════════\n")
     return deduped
@@ -1132,18 +1308,21 @@ Press Ctrl+C to stop
     if not REQUESTS_OK:     missing.append("requests")
     if not BS4_OK:          missing.append("beautifulsoup4")
     if not CLOUDSCRAPER_OK: missing.append("cloudscraper")
-    if not PLAYWRIGHT_OK:   missing.append("playwright")
 
     if missing:
         print(f"⚠️  Missing packages: {', '.join(missing)}")
         print(f"   Run: pip install {' '.join(missing)}")
-        if "playwright" in missing:
-            print("   Then: playwright install chromium\n")
         if not REQUESTS_OK or not BS4_OK:
             print("   requests + beautifulsoup4 are required. Exiting.")
             exit(1)
     else:
-        print("✅ All dependencies OK — live scraping ready\n")
+        print("✅ All dependencies OK — live scraping ready")
+        if not PLAYWRIGHT_OK:
+            print("⚠️  Playwright not available — LinkedIn scraping disabled")
+            print("   Unstop + Internshala scraping still active ✅\n")
+        else:
+            print()\
+
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
